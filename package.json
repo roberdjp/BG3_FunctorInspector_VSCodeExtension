@@ -1,7 +1,7 @@
 {
-  "name": "condition-hover",
-  "displayName": "BG3 Condition Hover",
-  "description": "Hover a Boosts/functor/condition line in a BG3 stats file to see it broken up by ;, and, or.",
+  "name": "bg3-functors-hover",
+  "displayName": "BG3 Functor Inspector",
+  "description": "Hover a Boosts/functor/condition line in a BG3 stats file to see it broken up by ;, and, or. Open a side window for editing in the broken out format and resave in the original format. Live editing available",
   "version": "0.0.1",
   "publisher": "local",
   "engines": {
