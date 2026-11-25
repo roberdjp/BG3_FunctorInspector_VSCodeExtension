@@ -30,8 +30,10 @@ const countLines = s => (s.match(/\n/g) || []).length;
 // One editable pane per (source line). The pane is a file in our own file system, so Ctrl+S in it
 // lands in writeFile below, which writes the collapsed text back into the source line.
 //
-// pane = { uri, sourceUri, line, field, baseline, content, mtime, lost, timer, reloading, asking }
+// pane = { uri, sourceUri, line, field, baseline, content, mtime, lost, timer, reloading, asking,
+//          opening, lastEditCount }
 //   baseline: the source value the pane was last loaded from or last pushed to the source.
+//   lastEditCount: non-whitespace characters before the end of the last edit made in the pane.
 // ---------------------------------------------------------------------------------------------
 const panes = new Map();   // pane uri string -> pane
 const fsEvents = new vscode.EventEmitter();
@@ -54,6 +56,38 @@ async function loadSource(pane) {
   if (!sourceDoc(pane)) {
     try { await vscode.workspace.openTextDocument(vscode.Uri.parse(pane.sourceUri)); } catch (_) { /* gone */ }
   }
+}
+
+// True if the pane holds edits that haven't reached the source. Compares content rather than
+// VS Code's dirty flag, which can stay set after our own reloads.
+function hasUnpushedEdits(pane) {
+  const doc = paneDoc(pane);
+  return !!doc && !sameValue(collapseEditable(doc.getText()), pane.baseline);
+}
+
+function hasOpenTab(pane) {
+  return vscode.window.tabGroups.all.some(g => g.tabs.some(t =>
+    t.input instanceof vscode.TabInputText && t.input.uri.toString() === pane.uri));
+}
+
+// Forget panes whose tab has been closed, so a closed pane never reacts to source edits.
+function sweepClosedPanes() {
+  for (const pane of [...panes.values()]) {
+    if (pane.opening || hasOpenTab(pane)) continue;
+    clearTimeout(pane.timer);
+    panes.delete(pane.uri);
+  }
+}
+
+// Column in the source line just after the n-th non-whitespace character of the value.
+function columnAfterCount(parsed, n) {
+  const value = parsed.value;
+  let i = 0;
+  while (n > 0 && i < value.length) {
+    if (!/\s/.test(value[i])) n--;
+    i++;
+  }
+  return parsed.start + i;
 }
 
 function wholeRange(doc) {
@@ -91,8 +125,19 @@ async function push(pane, text) {
   const edit = new vscode.WorkspaceEdit();
   edit.replace(src.doc.uri, new vscode.Range(pane.line, src.parsed.start, pane.line, src.parsed.end), value);
   const ok = await vscode.workspace.applyEdit(edit);
-  if (!ok) vscode.window.showErrorMessage("BG3 Condition: VS Code refused the edit to the original line.");
-  return ok;
+  if (!ok) {
+    vscode.window.showErrorMessage("BG3 Condition: VS Code refused the edit to the original line.");
+    return false;
+  }
+  // Leave the source cursor where the last change in the pane was made.
+  const editor = vscode.window.visibleTextEditors.find(ed => ed.document.uri.toString() === pane.sourceUri);
+  const after = readSource(pane);
+  if (editor && after && pane.lastEditCount != null) {
+    const pos = new vscode.Position(pane.line, columnAfterCount(after.parsed, pane.lastEditCount));
+    editor.selection = new vscode.Selection(pos, pos);
+    editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+  }
+  return true;
 }
 
 // Replace the pane's text with the current source value (the pane's own edit, then saved).
@@ -152,9 +197,31 @@ const fsProvider = {
     if (!pane) throw vscode.FileSystemError.FileNotFound(uri);
     return Buffer.from(pane.content, "utf8");
   },
-  async writeFile(uri, bytes) {
+  // Saves of one pane run one at a time. Two overlapping saves (quick Ctrl+S twice, or a live-sync
+  // save plus Ctrl+S) would otherwise read the source before the first one's edit has landed and
+  // mistake our own write for an outside change.
+  writeFile(uri, bytes) {
     const pane = panes.get(uri.toString());
     if (!pane) throw vscode.FileSystemError.NoPermissions("This BG3 condition pane is no longer linked to a stats line.");
+    const run = pane.queue.then(async () => {
+      pane.writing = true;
+      try {
+        await writePane(pane, uri, bytes);
+      } finally {
+        pane.writing = false;
+      }
+      if (pane.recheck) { pane.recheck = false; reconcile(pane); }
+    });
+    pane.queue = run.catch(() => {});
+    return run;
+  },
+  readDirectory: () => [],
+  createDirectory() { throw vscode.FileSystemError.NoPermissions(); },
+  delete() { throw vscode.FileSystemError.NoPermissions(); },
+  rename() { throw vscode.FileSystemError.NoPermissions(); }
+};
+
+async function writePane(pane, uri, bytes) {
     const text = Buffer.from(bytes).toString("utf8");
     if (!pane.reloading) {
       clearTimeout(pane.timer);
@@ -178,12 +245,20 @@ const fsProvider = {
     pane.content = text;
     pane.mtime = Date.now();
     fsEvents.fire([{ type: vscode.FileChangeType.Changed, uri }]);
-  },
-  readDirectory: () => [],
-  createDirectory() { throw vscode.FileSystemError.NoPermissions(); },
-  delete() { throw vscode.FileSystemError.NoPermissions(); },
-  rename() { throw vscode.FileSystemError.NoPermissions(); }
-};
+}
+
+// The source line no longer matches what the pane last synced: reload a pane with nothing
+// unpushed, otherwise ask.
+function reconcile(pane) {
+  const src = readSource(pane);
+  if (!src || sameValue(src.parsed.value, pane.baseline)) return;
+  if (config().get("liveSync") || !hasUnpushedEdits(pane)) {
+    clearTimeout(pane.timer);
+    reload(pane, src.parsed.value);
+  } else {
+    notifyConflict(pane);
+  }
+}
 
 // Keep each pane's line number right as the source file is edited, and react to changes to the line itself.
 function onSourceChanged(e) {
@@ -217,22 +292,28 @@ function onSourceChanged(e) {
     if (found < 0) { pane.lost = true; continue; }
     pane.line = found;
 
-    const value = parseLine(e.document.lineAt(found).text).value;
-    if (sameValue(value, pane.baseline)) continue;   // our own push, a move, or a whitespace-only change
-    const doc = paneDoc(pane);
-    if (config().get("liveSync") || !doc || !doc.isDirty) {
-      clearTimeout(pane.timer);
-      reload(pane, value);
-    } else {
-      notifyConflict(pane);
-    }
+    // Mid-save, the change is most likely our own write: check again once the save is done.
+    if (pane.writing || pane.reloading) { pane.recheck = true; continue; }
+    reconcile(pane);
   }
 }
 
-// Live mode: push after a pause in typing, by saving the pane (same path as Ctrl+S).
+// Remembers where the last edit in the pane ended (as a count of non-whitespace characters, which
+// maps straight onto the source value). Live mode: push after a pause in typing, by saving the
+// pane (same path as Ctrl+S).
 function onPaneChanged(e) {
   const pane = findPane(e.document);
-  if (!pane || pane.reloading || !config().get("liveSync") || !e.contentChanges.length) return;
+  if (!pane || pane.reloading || !e.contentChanges.length) return;
+
+  // Changes arrive in pre-change offsets; walk them in order to find where the last one ends now.
+  let shift = 0, endOffset = 0;
+  for (const c of [...e.contentChanges].sort((a, b) => a.rangeOffset - b.rangeOffset)) {
+    endOffset = c.rangeOffset + shift + c.text.length;
+    shift += c.text.length - c.rangeLength;
+  }
+  pane.lastEditCount = e.document.getText().slice(0, endOffset).replace(/\s+/g, "").length;
+
+  if (!config().get("liveSync")) return;
   clearTimeout(pane.timer);
   pane.timer = setTimeout(() => { if (e.document.isDirty) e.document.save(); }, Math.max(100, config().get("liveSyncDelay", 500)));
 }
@@ -278,13 +359,20 @@ async function openBeside(linkUri, lineNo) {
     const uri = vscode.Uri.from({ scheme: SCHEME, path: `/${nextId++}/${name}` });
     pane = {
       uri: uri.toString(), sourceUri, line: lineNo, field: parsed.field, baseline: parsed.value,
-      content: formatEditable(parsed.value) + "\n", mtime: Date.now(), lost: false, timer: null, reloading: false, asking: false
+      content: formatEditable(parsed.value) + "\n", mtime: Date.now(), lost: false, timer: null,
+      reloading: false, asking: false, opening: false, lastEditCount: null,
+      queue: Promise.resolve(), writing: false, recheck: false
     };
     panes.set(pane.uri, pane);
   }
-  let doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(pane.uri));
-  if (doc.languageId !== "bg3") doc = await vscode.languages.setTextDocumentLanguage(doc, "bg3");
-  await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.Beside, preview: true, preserveFocus: true });
+  pane.opening = true;   // no tab yet: keep sweepClosedPanes from dropping it
+  try {
+    let doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(pane.uri));
+    if (doc.languageId !== "bg3") doc = await vscode.languages.setTextDocumentLanguage(doc, "bg3");
+    await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.Beside, preview: true, preserveFocus: true });
+  } finally {
+    pane.opening = false;
+  }
 }
 
 function activate(context) {
@@ -314,15 +402,10 @@ function activate(context) {
     vscode.commands.registerCommand("bg3ConditionHover.openBeside", openBeside),
     vscode.workspace.onDidChangeTextDocument(e => (e.document.uri.scheme === SCHEME ? onPaneChanged(e) : onSourceChanged(e))),
     vscode.window.onDidChangeTextEditorSelection(onPaneSelection),
-    // Changing a document's language closes and reopens it, so only forget a pane once it
-    // has stayed closed for a moment.
-    vscode.workspace.onDidCloseTextDocument(d => {
-      const pane = findPane(d);
-      if (!pane) return;
-      setTimeout(() => {
-        if (!paneDoc(pane)) { clearTimeout(pane.timer); panes.delete(pane.uri); }
-      }, 2000);
-    })
+    // A pane lives as long as its tab. (Document close events are no good for this: VS Code
+    // unloads documents long after their tab closes, and a language change closes and reopens one.)
+    vscode.window.tabGroups.onDidChangeTabs(sweepClosedPanes),
+    vscode.window.tabGroups.onDidChangeTabGroups(sweepClosedPanes)
   );
 }
 
