@@ -1,0 +1,90 @@
+{
+  "name": "condition-hover",
+  "displayName": "BG3 Condition Hover",
+  "description": "Hover a Boosts/functor/condition line in a BG3 stats file to see it broken up by ;, and, or.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:bg3",
+    "onLanguage:plaintext",
+    "onFileSystem:bg3-condition"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "bg3ConditionHover.openBeside",
+        "title": "BG3: Edit broken-up condition beside"
+      }
+    ],
+    "configuration": {
+      "title": "BG3 Condition Hover",
+      "properties": {
+        "bg3ConditionHover.liveSync": {
+          "type": "boolean",
+          "default": false,
+          "description": "Off: the \"open beside\" pane writes back to the original line when you save the pane (Ctrl+S). On: it writes back while you type, after a short pause (see Live Sync Delay)."
+        },
+        "bg3ConditionHover.liveSyncDelay": {
+          "type": "number",
+          "default": 500,
+          "minimum": 100,
+          "description": "Live sync only: milliseconds of no typing before the pane writes back. Each write is one undo step in the original file."
+        },
+        "bg3ConditionHover.syncCursor": {
+          "type": "boolean",
+          "default": true,
+          "description": "Moving the cursor in the \"open beside\" pane selects the same character on the original line (when that file is visible)."
+        },
+        "bg3ConditionHover.fields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Stats fields (the name in data \"Field\" \"...\") that get the broken-up hover.",
+          "default": [
+            "Boosts",
+            "BoostsOnEquipMainHand",
+            "BoostsOnEquipOffHand",
+            "PassiveOwnerBoosts",
+            "Conditions",
+            "RequirementConditions",
+            "TargetConditions",
+            "AoEConditions",
+            "RemoveConditions",
+            "SpellRoll",
+            "SpellSuccess",
+            "SpellFail",
+            "SpellProperties",
+            "StatsFunctors",
+            "OnApplyFunctors",
+            "OnRemoveFunctors",
+            "OnTickFunctors",
+            "TickFunctors",
+            "ToggleOnFunctors",
+            "ToggleOffFunctors",
+            "Roll",
+            "Success",
+            "Failure"
+          ]
+        }
+      }
+    },
+    "configurationDefaults": {
+      "[bg3]": {
+        "editor.hover.delay": 1500
+      }
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "bg3ConditionHover.openBeside",
+          "when": "false"
+        }
+      ]
+    }
+  }
+}
