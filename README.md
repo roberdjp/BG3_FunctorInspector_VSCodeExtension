@@ -5,4 +5,4 @@ Optional live-editing of "Beside" window.
 
 Install with CTRL-Shift-P "Install Extension from Location". Just select the "BGf_FunctorInspector_VSCodeExtension" folder.
 
-** *Written entirely by AI, so use at your own risk or boycott on principle**
+**\*Written entirely by AI, so use at your own risk or boycott on principle**
